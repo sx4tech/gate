@@ -19,11 +19,13 @@ import os
 import re
 import sys
 import time
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+from performance import performance_select
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -42,7 +44,8 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "8")))
+CHECK_ROUNDS = max(2, int(os.environ.get("CHECK_ROUNDS", "2")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
@@ -85,15 +88,16 @@ EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        "162.159.254.80:443,172.64.72.163:443,172.64.190.34:443,"
+        "172.64.229.250:443,172.64.84.108:443,104.29.125.46:2053,"
+        "104.29.111.60:8443,8.39.214.244:443,x00x.dpdns.org:443",
     ).split(",")
     if h.strip()
 ]
 
 # 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
-OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
+OPTIMAL_API = os.environ.get("OPTIMAL_API", "")
+EDGETUNNEL_HOST = os.environ.get("EDGETUNNEL_HOST", "x00x.dpdns.org")
 
 NODES_URL = os.environ.get("NODES_URL", "https://sx4tech.github.io/gate/nodes.txt")
 
@@ -142,6 +146,13 @@ def fetch_vpngate():
         log("VPN GATE", f"回退镜像也失败: {exc}")
     die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
 
+def source_speed(value):
+    try:
+        speed = float(value or 0) / 1_000_000
+        return speed if 0 <= speed < 1_000_000 else 0
+    except (TypeError, ValueError):
+        return 0
+
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
     header_idx = None
@@ -186,6 +197,7 @@ def parse_csv(text):
             "country_long": fields[pos["countrylong"]].strip(),
             "country_short": fields[pos["countryshort"]].strip(),
             "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+            "source_speed_mbps": source_speed(fields[header.index("Speed")]) if "Speed" in header and header.index("Speed") < len(fields) else 0,
         })
     return rows
 
@@ -208,6 +220,7 @@ def parse_mirror_json(data):
             "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
             "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
             "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
+            "source_speed_mbps": source_speed(s.get("speed")),
         })
     return rows
 
@@ -295,7 +308,8 @@ def to_sstp_nodes(rows):
         host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
-        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"],
+            "source_speed_mbps": r.get("source_speed_mbps", 0)})
     return nodes
 
 def dedupe(nodes):
@@ -370,9 +384,24 @@ def check_one(node, session):
         return out
 
 def check_all(nodes, session):
+    def repeated(node):
+        # Each task owns its Session; do not share mutable connections across threads.
+        with requests.Session() as local:
+            samples = [check_one(node, local) for _ in range(CHECK_ROUNDS)]
+        successful = [s for s in samples if s.get("success") and isinstance(s.get("latency_ms"), (int, float))]
+        out = dict(successful[-1] if successful else samples[-1])
+        out["validation_attempts"] = len(samples)
+        out["validation_successes"] = len(successful)
+        out["success"] = len(successful) == len(samples)
+        out["status"] = "success" if out["success"] else "unstable"
+        out["worker_error"] = all(s.get("worker_error") for s in samples)
+        times = [s["latency_ms"] for s in successful]
+        out["validation_samples_ms"] = times
+        out["latency_ms"] = round(statistics.median(times)) if times else None
+        return out
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(repeated, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -380,8 +409,9 @@ def check_all(nodes, session):
 # ---------------------------------------------------------------------------
 # 生成数据
 # ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+def build_outputs(results, raw_count, sstp_count, source, selected=None):
+    available = selected if selected is not None else [r for r in results if r.get("success")]
+    reachable = sum(bool(r.get("success")) for r in results)
     countries = {}
     for n in available:
         c = n["country"] or "未知"
@@ -392,7 +422,9 @@ def build_outputs(results, raw_count, sstp_count, source):
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed": len(results) - len(available),
+        "reachable": reachable,
+        "filtered": reachable - len(available),
+        "failed": len(results) - reachable,
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
@@ -418,26 +450,16 @@ def build_nodes_text(data, edge_hosts):
     """
     生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
     """
-    countries = data["countries"]
-    edge = edge_hosts
+    if not edge_hosts:
+        return ""
     lines = []
-    idx = 0
-    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
-    for cname, grp in ordered:
-        code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-    return "\n".join(lines) + "\n"
+    for i, node in enumerate(data["available"]):
+        entry = edge_hosts[i % len(edge_hosts)]
+        country = COUNTRY_ZH.get(node["country_code"]) or node["country_code"]
+        label = {"residential": "住宅", "datacenter": "机房"}.get(node["residential"], "未知")
+        rate = node["performance"]["download_mbps"]
+        lines.append(f"{entry}#{country}-{label}-{i+1:02d}-{rate:.0f}Mbps$sstp://vpn:vpn@{node['host']}:{node['port']}")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 def write_outputs(data, edge_hosts):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
@@ -503,12 +525,17 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    # 动态拉取 API 并与静态优选域名混合
+    log("PERFORMANCE", "开始顺序下载测速（避免并发抢带宽），不使用 VPN Gate 标称速度代替实测")
     edge_hosts = get_combined_edge_hosts()
+    selected, edge_hosts, performance_report = performance_select(results, edge_hosts, EDGETUNNEL_HOST)
+    data = build_outputs(results, raw_count, sstp_count, source, selected=selected)
+    data["performance"] = performance_report
+    log("RESULT", f"重复检测通过 {len(success)} 个，入口测速通过 {len(edge_hosts)} 个，速度筛选通过 {len(selected)} 个")
+    for node in selected:
+        p = node["performance"]
+        log("RESULT", f"{node['country_code']} {node['host']} 保守下载 {p['download_mbps']} Mbps，HTTPS 首包 {p['ttfb_ms']} ms")
+    if not selected:
+        log("QUALITY", "本轮没有节点满足速度与稳定性门槛；发布空优选列表，不把未测速节点作为优选")
 
     data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")

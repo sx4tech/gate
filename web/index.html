@@ -35,6 +35,9 @@
   .b-dc { background: rgba(255,184,77,.15); color: var(--dc); }
   .b-unk { background: rgba(138,155,181,.15); color: var(--unk); }
   .lat { color: var(--ok); }
+  .table-scroll { overflow-x: auto; }
+  .method { color: var(--muted); font-size: 13px; line-height: 1.7; margin-bottom: 18px; }
+  a { color: var(--accent); }
   code { background: var(--panel2); padding: 2px 6px; border-radius: 5px; font-size: 12px; cursor: pointer; }
   code:hover { outline: 1px solid var(--accent); }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
@@ -45,9 +48,11 @@
 <body>
 <div class="wrap">
   <h1>VPN Gate · SSTP 节点检测</h1>
-  <div class="sub">节点来自 VPN Gate（仅 TCP 入口中继），检测由 Cloudflare Worker 执行，GitHub Actions 定时刷新</div>
+  <div class="sub">重复连通检测、入口 HTTPS 测试、出口真实下载测速；每小时自动更新，只订阅通过质量门槛的节点。</div>
 
   <div class="cards" id="cards"></div>
+  <div class="method" id="method"></div>
+  <div id="entries"></div>
 
   <div class="bar">
     <span class="pill on" data-f="all">全部</span>
@@ -75,7 +80,8 @@ function renderCards(d) {
     ["最后更新", d.generated_at || "-", "时区 UTC"],
     ["SSTP 节点", s.sstp_nodes, "筛选自 VPN Gate"],
     ["已检测", s.checked, "提交给 Worker"],
-    ["可用节点", s.success, "success = true"],
+    ["连通通过", s.reachable ?? s.success, "重复检测全部成功"],
+    ["优选节点", s.success, "通过速度与稳定性门槛"],
     ["国家数量", s.countries, "按可用节点统计"],
     ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)]
   ];
@@ -85,6 +91,7 @@ function renderCards(d) {
 }
 
 function rowHtml(n) {
+  const p = n.performance || {};
   let badge;
   if (n.residential === "residential") badge = '<span class="badge b-res">住宅</span>';
   else if (n.residential === "datacenter") badge = '<span class="badge b-dc">机房</span>';
@@ -96,6 +103,9 @@ function rowHtml(n) {
     '<td class="hide-m">' + (n.country_code || "") + '</td>' +
     '<td>SSTP</td>' +
     '<td class="lat">' + (n.latency_ms != null ? n.latency_ms + ' ms' : '-') + '</td>' +
+    '<td class="lat">' + (p.download_mbps != null ? p.download_mbps + ' Mbps' : '-') + '</td>' +
+    '<td>' + (p.ttfb_ms != null ? p.ttfb_ms + ' ms' : '-') + '</td>' +
+    '<td class="hide-m">' + (p.jitter_ms != null ? p.jitter_ms + ' ms' : '-') + '</td>' +
     '<td class="hide-m" style="color:var(--muted)">' + exit + '</td>' +
     '<td>' + badge + '</td>' +
     '<td class="hide-m" style="color:var(--muted)">' + date + '</td>' +
@@ -113,7 +123,7 @@ function renderCountries() {
     .sort(function (a, b) { return b[1].count - a[1].count; });
 
   if (!entries.length) {
-    box.innerHTML = '<div class="country"><div class="empty">没有符合当前筛选的可用节点（本轮 Worker 判定全部不可用或无数据）</div></div>';
+    box.innerHTML = '<div class="country"><div class="empty">本轮没有节点同时通过连通、速度与稳定性门槛；请查看测速记录。</div></div>';
     return;
   }
   box.innerHTML = entries.map(function (x) {
@@ -123,8 +133,8 @@ function renderCountries() {
         '<span>🌏 ' + name + ' <span class="tag">' + (g.code || "") + '</span></span>' +
         '<span class="tag">' + g.count + ' 个节点 · 住宅 ' + g.residential + ' · 机房 ' + g.datacenter + '</span>' +
       '</div>' +
-      '<table><thead><tr><th>Host:Port</th><th class="hide-m">国码</th><th>协议</th><th>延迟</th><th class="hide-m">出口</th><th>类型</th><th class="hide-m">检测日期</th></tr></thead>' +
-      '<tbody>' + g.nodes.map(rowHtml).join("") + '</tbody></table>' +
+      '<div class="table-scroll"><table><thead><tr><th>Host:Port</th><th class="hide-m">国码</th><th>协议</th><th>建链检测耗时</th><th>实测下载</th><th>HTTPS 首包</th><th class="hide-m">首包波动</th><th class="hide-m">出口</th><th>类型</th><th class="hide-m">检测日期</th></tr></thead>' +
+      '<tbody>' + g.nodes.map(rowHtml).join("") + '</tbody></table></div>' +
     '</div>';
   }).join("");
 }
@@ -132,6 +142,18 @@ function renderCountries() {
 function render() {
   renderCards(DATA);
   renderCountries();
+  const perf = DATA.performance || {};
+  const limits = perf.thresholds || {};
+  document.getElementById("method").textContent =
+    "测速来自 GitHub 自动检测服务器，入口与 SSTP 出口分别测量，不是客户端完整代理链路测速。下载值取两次实测中的较低值，包含首包等待，不使用 VPN Gate 标称带宽冒充实测。" +
+    "当前门槛：出口至少 " + (limits.exit_min_mbps ?? 10) + " Mbps，HTTPS 首包不高于 " + (limits.exit_max_ttfb_ms ?? 1500) +
+    " ms。未达标节点不写入订阅。";
+  const entries = perf.entries || [];
+  document.getElementById("entries").innerHTML = entries.length ?
+    '<div class="country"><div class="head">通过测速的 Cloudflare 入口 <a href="nodes.txt">优选节点文件</a></div>' +
+    '<div class="table-scroll"><table><thead><tr><th>入口地址</th><th>HTTPS 连接检测</th><th>实测下载</th><th>测速机房</th></tr></thead><tbody>' +
+    entries.map(e => '<tr><td>' + e.endpoint + '</td><td>' + e.https_latency_ms + ' ms</td><td>' + e.download_mbps +
+      ' Mbps</td><td>' + (e.colo || '-') + '</td></tr>').join('') + '</tbody></table></div></div>' : '';
   const s = DATA.stats || {};
   document.getElementById("foot").textContent =
     "数据时间 " + (DATA.generated_at || "?") + " · 来源 " + (DATA.source || "?") + " · 可用 " + (s.success || 0) + " / 检测 " + (s.checked || 0) + " · 点击 host:port 复制 sstp 链接";

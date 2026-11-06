@@ -1,8 +1,25 @@
+# 性能优选（2026-11-06）
+
+本仓库现在先重复验证可用性，再做真实下载测速；`nodes.txt` 只包含通过速度、首包时间和波动门槛的节点。每小时第 17 分钟自动刷新，最多发布 6 个节点、每个国家最多 3 个。
+
+- 入口：3 次 HTTPS/证书/Cloudflare trace 验证，2 次 2 MiB 下载；保留综合表现最好的 3 个 IPv4 入口。
+- 出口：从重复连通检测通过的候选里取 12 个，逐个通过 SSTP 下载，2 次测速均成功且较低值至少 10 Mbps，HTTPS 首包中位数不高于 1500 ms、波动不高于 500 ms。
+- 下载速度包含 HTTP 首包等待，以有效响应的实际 payload 字节数计算；非 200、截断、超时和证书错误均拒绝。测速按顺序执行，避免自身并发抢带宽。
+- 测速来自 GitHub runner，入口和出口是分开的测试，不是你本机经过 edgetunnel 的完整链路测速。不要把这些 ms 当作客户端 ping，也不要把 VPN Gate 标称速度当作实测。
+- IPv6 入口仍可在客户端自行测速；自动发布默认使用 IPv4，避免 runner IPv6 连接能力与客户端不同造成误导。
+- 本轮若无合格节点会发布空优选列表，并在页面说明，不使用未测速或低速节点凑数。
+- `data.json` 含逐项测量、拒绝原因和门槛，GitHub Actions 的 `quality-measurements` artifact 保存 3 天。检测 Worker URL 仅来自 `DOMAIN` Secret，不输出到公开数据。
+- edgetunnel 已引用 `https://sx4tech.github.io/gate/nodes.txt`，客户端刷新订阅即可获取新的优选条目。后台原来手填的其他地址独立于此列表。
+
+可调参数在 `.github/workflows/check.yml`：`ENTRY_MAX_LATENCY_MS`、`ENTRY_MIN_MBPS`、`EXIT_MIN_MBPS`、`EXIT_MAX_TTFB_MS`、`EXIT_MAX_JITTER_MS`、`MAX_SELECTED_NODES`。SSTP 实现复用检测 Worker 的开源后端，经过 Node.js 适配，许可证与出处见 `tools/vendor/`。
+
+---
+
 # VPNGate SSTP 家宽节点（edgetunnel 链式代理） 🚀
 
-自动抓取 [VPN Gate](https://www.vpngate.net/) 的 SSTP 家宽/机房节点，调用检测 Worker 逐个验证可用性，按国家分组、标注住宅/机房，生成可直接通过 **URL 自动轮换** 的节点清单。**每 30 分钟自动更新一次。**
+自动抓取 [VPN Gate](https://www.vpngate.net/) 的 SSTP 家宽/机房节点，调用检测 Worker 逐个验证可用性，按国家分组、标注住宅/机房，生成可直接通过 **URL 自动轮换** 的节点清单。**每小时自动更新一次。**
 
-> 核心价值：VPN Gate 的 SSTP 节点 30 分钟就换一批，手动测试筛选太痛苦。本仓库把它全自动了——你只需把 `nodes.txt` 的网址填进 edgetunnel 后台一次，之后节点每 30 分钟自动换，零手动。
+> 核心价值：VPN Gate 的 SSTP 节点 随时可能变更，手动测试筛选太痛苦。本仓库把它全自动了——你只需把 `nodes.txt` 的网址填进 edgetunnel 后台一次，之后节点每小时自动换，零手动。
 
 ---
 
@@ -10,7 +27,7 @@
 
 ~~~text
 VPN Gate 官方源
-      │  (每 30 分钟，GitHub Actions 定时抓取)
+      │  (每小时，GitHub Actions 定时抓取)
       ▼
 筛选 SSTP 节点 → 去重
       │
@@ -28,7 +45,7 @@ VPN Gate 官方源
 edgetunnel 后台「自定义优选IP」框填 https://…/nodes.txt
       │  edgetunnel 每次生成订阅时自动 fetch → 解析 $sstp:// → 套链式代理
       ▼
-客户端订阅 edgetunnel 订阅 → 使用 SSTP 家宽节点 (每 30 分钟自动换)
+客户端订阅 edgetunnel 订阅 → 使用 SSTP 家宽节点 (每小时自动换)
 ~~~
 
 ---
@@ -104,7 +121,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 3. 点保存
 4. 客户端刷新订阅 → 每次刷新 edgetunnel 都重新拉取一次 nodes.txt，节点自动更新
 
-> 原理：`nodes.txt` 是纯节点行版本（无注释头），每行 `入口域名:443#国家-住宅-01$sstp://vpn:vpn@节点:端口`。edgetunnel 下次生成订阅时会 fetch 这个网址、逐行解析成优选入口 + 链式代理指令。你只填一次，之后节点每 30 分钟自动换、零手动。
+> 原理：`nodes.txt` 是纯节点行版本（无注释头），每行 `入口域名:443#国家-住宅-01$sstp://vpn:vpn@节点:端口`。edgetunnel 下次生成订阅时会 fetch 这个网址、逐行解析成优选入口 + 链式代理指令。你只填一次，之后节点每小时自动换、零手动。
 
 ---
 
@@ -154,7 +171,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ---
 
-*流水线：GitHub Actions（每 30 分钟 cron） → vpngate.py → 检测 Worker → GitHub Pages*
+*流水线：GitHub Actions（每小时 cron） → vpngate.py → 检测 Worker → GitHub Pages*
 
 ---
 

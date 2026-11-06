@@ -1,9 +1,11 @@
 name: VPN Gate Node Check
 
 on:
+  push:
+    branches: [main, performance-optimization]
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
@@ -30,22 +32,53 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify measurement and selection rules
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          node --test tests/perf_probe.test.mjs
+
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
           CHECK_WORKER: ${{ secrets.DOMAIN }}
-          CHECK_CONCURRENCY: "32"
+          CHECK_CONCURRENCY: "8"
+          CHECK_ROUNDS: "2"
           CHECK_TIMEOUT: "90"
+          EDGETUNNEL_HOST: "x00x.dpdns.org"
+          ENTRY_MAX_LATENCY_MS: "800"
+          ENTRY_MIN_MBPS: "10"
+          EXIT_MIN_MBPS: "10"
+          EXIT_MAX_TTFB_MS: "1500"
+          EXIT_MAX_JITTER_MS: "500"
+          SPEED_MAX_CANDIDATES: "12"
+          MAX_SELECTED_NODES: "6"
+          SPEED_TEST_BYTES: "2097152"
+
+      - name: Save measurement results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-measurements
+          path: public/
+          retention-days: 3
 
       - name: Configure Pages
+        if: github.ref == 'refs/heads/main'
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'public'
 
       - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
         id: deployment
         uses: actions/deploy-pages@v4
 
